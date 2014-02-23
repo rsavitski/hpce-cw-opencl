@@ -129,7 +129,7 @@ void StepWorldV3OpenCL(world_t &world, float dt, unsigned n)
   // context
   cl::Context context(devices);
 
-  std::string kernelSource = LoadSource("step_world_v3_kernel.cl");
+  std::string kernelSource = LoadSource("step_world_v5_kernel.cl");
 
   cl::Program::Sources sources;  // A vector of (data,length) pairs
   sources.push_back(
@@ -151,8 +151,8 @@ void StepWorldV3OpenCL(world_t &world, float dt, unsigned n)
 
   size_t cbBuffer = 4 * world.w * world.h;
   cl::Buffer buffProperties(context, CL_MEM_READ_ONLY, cbBuffer);
-  cl::Buffer buffState(context, CL_MEM_READ_ONLY, cbBuffer);
-  cl::Buffer buffBuffer(context, CL_MEM_WRITE_ONLY, cbBuffer);
+  cl::Buffer buffState(context, CL_MEM_READ_WRITE, cbBuffer);
+  cl::Buffer buffBuffer(context, CL_MEM_READ_WRITE, cbBuffer);
 
   cl::Kernel kernel(program, "kernel_xy");
 
@@ -167,34 +167,53 @@ void StepWorldV3OpenCL(world_t &world, float dt, unsigned n)
 
   cl::CommandQueue queue(context, device);
 
-  queue.enqueueWriteBuffer(buffProperties, CL_TRUE, 0, cbBuffer,
-                           &world.properties[0]);
-
   unsigned w = world.w, h = world.h;
-  // This is our temporary working space
-  std::vector<float> buffer(w * h);
+  std::vector<uint32_t> packed(world.properties.begin(),
+                               world.properties.end());
+
+  for (unsigned y = 0; y < h; ++y) {
+    for (unsigned x = 0; x < w; ++x) {
+      unsigned index = y * w + x;
+      if (!packed[index]) {
+        if (!(packed[index - w] & Cell_Insulator)) {
+          packed[index] |= 0x4;
+        }
+
+        if (!(packed[index + w] & Cell_Insulator)) {
+          packed[index] |= 0x8;
+        }
+
+        if (!(packed[index - 1] & Cell_Insulator)) {
+          packed[index] |= 0x10;
+        }
+
+        if (!(packed[index + 1] & Cell_Insulator)) {
+          packed[index] |= 0x20;
+        }
+      }
+    }
+  }
+
+  queue.enqueueWriteBuffer(buffProperties, CL_TRUE, 0, cbBuffer, &packed[0]);
 
   cl::NDRange offset(0, 0);      // Always start iterations at x=0, y=0
   cl::NDRange globalSize(w, h);  // Global size must match the original loops
   cl::NDRange localSize = cl::NullRange;  // We don't care about local size
 
+  queue.enqueueWriteBuffer(buffState, CL_TRUE, 0, cbBuffer, &world.state[0]);
+
   for (unsigned t = 0; t < n; t++) {
-    cl::Event evCopiedState;
-    queue.enqueueWriteBuffer(buffState, CL_FALSE, 0, cbBuffer, &world.state[0],
-                             NULL, &evCopiedState);
+    queue.enqueueNDRangeKernel(kernel, offset, globalSize, localSize);
+    queue.enqueueBarrier();
 
-    std::vector<cl::Event> kernelDependencies(1, evCopiedState);
-    cl::Event evExecutedKernel;
-    queue.enqueueNDRangeKernel(kernel, offset, globalSize, localSize,
-                               &kernelDependencies, &evExecutedKernel);
+    std::swap(buffState, buffBuffer);
+    kernel.setArg(2, buffState);
+    kernel.setArg(4, buffBuffer);
 
-    std::vector<cl::Event> copyBackDependencies(1, evExecutedKernel);
-    queue.enqueueReadBuffer(buffBuffer, CL_TRUE, 0, cbBuffer, &buffer[0],
-                            &copyBackDependencies);
-
-    std::swap(world.state, buffer);
     world.t += dt;  // We have moved the world forwards in time
   }
+
+  queue.enqueueReadBuffer(buffState, CL_TRUE, 0, cbBuffer, &world.state[0]);
 }
 };
 };  // namepspace hpce
